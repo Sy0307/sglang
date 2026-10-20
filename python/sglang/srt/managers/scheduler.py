@@ -1994,6 +1994,19 @@ class Scheduler(
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
+            # Hand a prefill result out before forming the next batch, in the
+            # normal loop's order; decode steps keep their overlap.
+            early = False
+            if (
+                self.last_batch is not None
+                and self.result_queue
+                and self.last_batch.forward_mode.is_extend()
+                and not self.require_mlp_sync
+                and self.last_batch.spec_algorithm.is_none()
+            ):
+                pop_and_process()
+                early = True
+
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -2007,7 +2020,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and not early:
                 pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
@@ -2030,7 +2043,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not early:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
