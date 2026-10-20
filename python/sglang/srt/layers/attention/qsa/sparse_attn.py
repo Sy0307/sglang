@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.qsa.ttft_kernels import PagedKV, sparse_gqa_paged
+
 _H20_CONFIGS = [
     (32, (32, 8, 2)),
     (64, (64, 8, 2)),
@@ -338,6 +340,16 @@ def _pack_qsa_prefill_kv(
 def pack_qsa_prefill_kv(
     *, k, v, req_to_token, req_indices, cu_k, total_k, max_k, output_dtype=None
 ):
+    # The packing kernel is pure overhead when K and V already have the
+    # requested dtype: hand the pool and its token map to the sparse kernel
+    # and let it gather. Same loads, bit-identical output.
+    if k.is_cuda and k.dtype == v.dtype and (
+        output_dtype is None or output_dtype == k.dtype
+    ):
+        return (
+            PagedKV(k, req_to_token, req_indices, output_dtype),
+            PagedKV(v, req_to_token, req_indices, output_dtype),
+        )
     heads, dim = k.shape[1:]
     packed_k = torch.empty(
         (total_k, heads, dim), dtype=output_dtype or k.dtype, device=k.device
@@ -377,6 +389,10 @@ def pack_qsa_prefill_kv(
 
 
 def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+    if isinstance(k, PagedKV):
+        return sparse_gqa_paged(
+            q, k, v, indices, cu_q, kv_lens, scale, _ttft_best_config(q.shape[0])
+        )
     k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
