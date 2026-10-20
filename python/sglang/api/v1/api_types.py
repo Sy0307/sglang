@@ -578,7 +578,14 @@ SamplingParamsOrList = Union[SamplingParams, SamplingParamsList]
 
 
 def decode_TokenIds(value: Any) -> TokenIds:
-    return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
+    # JSON decoding yields exact ints for integer literals, so the common
+    # case is one C-level type check instead of a per-element walk. Any
+    # other element type takes the original path, keeping accepted values
+    # and error texts unchanged.
+    seq = _expect_seq(value, expected="a sequence")
+    if set(map(type, seq)) <= {int}:
+        return list(seq)
+    return [_expect_int(e, expected="i64") for e in seq]
 
 
 def encode_TokenIds(v: TokenIds) -> List[Any]:
