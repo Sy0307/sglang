@@ -7,6 +7,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.layers.attention.qsa.ttft_kernels import triton_qsa_mqa_prefill
 from sglang.srt.utils.common import is_hip
 
 try:
@@ -310,6 +311,24 @@ def tilelang_qsa_mqa_prefill(
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Validated TileLang packed prefill kernel with weights removed."""
+
+    # One Triton launch splits the key axis across CTAs and fuses scale + mask,
+    # so every SM works even when there are only a few row blocks. Bit-identical
+    # to the TileLang path for bf16 with four heads; anything else falls through.
+    if (
+        q.is_cuda
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and q.ndim == 3
+        and q.shape[1] == 4
+        and q.shape[0] > 0
+        and k.shape[0] > 0
+    ):
+        _validate_q(q)
+        _validate_k(k)
+        return triton_qsa_mqa_prefill(
+            q, k, row_starts, row_ends, score_scale, KQ=True, SUM=1
+        )
 
     if not HAS_TILELANG:
         raise RuntimeError("TileLang is unavailable")
