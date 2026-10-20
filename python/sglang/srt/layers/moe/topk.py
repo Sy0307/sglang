@@ -108,6 +108,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackendLike,
+    RoutingMethodType,
     has_per_rank_fused_shared_slots,
 )
 from sglang.srt.model_executor.forward_context import (
@@ -274,6 +275,7 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     runner_backend: Optional[MoeRunnerBackendLike] = None
+    routing_method_type: Optional[RoutingMethodType] = None
     scoring_func: str = "softmax"
     # sqrtsoftplus through log1p with NaNs ranked first (DeepSeek-V4.1 routing).
     sqrtsoftplus_log1p: bool = False
@@ -599,6 +601,46 @@ def _simulate_balanced_routing(
     )
 
 
+def _can_bypass_trtllm_routing(config: TopKConfig) -> bool:
+    """Match the native selector to the materialized router's policy."""
+    method = config.routing_method_type
+    if (
+        method is None
+        or method == RoutingMethodType.Unspecified
+        or config.sqrtsoftplus_log1p
+        or config.num_shared_topk_slots != 0
+    ):
+        return False
+    plain = not config.use_grouped_topk and config.correction_bias is None
+    if method == RoutingMethodType.Llama4:
+        return (
+            plain
+            and config.top_k == 1
+            and not config.renormalize
+            and config.custom_routing_function is not None
+        )
+    if config.custom_routing_function is not None:
+        return False
+    if method == RoutingMethodType.DeepSeekV3:
+        # The biased grouped router uses sigmoid regardless of scoring_func.
+        return (
+            config.use_grouped_topk
+            and config.correction_bias is not None
+            and config.renormalize
+        )
+    if not plain:
+        return False
+    if method in (RoutingMethodType.Renormalize, RoutingMethodType.RenormalizeNaive):
+        return config.scoring_func == "softmax" and config.renormalize
+    if method == RoutingMethodType.Default:
+        return config.scoring_func == "softmax" and not config.renormalize
+    if method == RoutingMethodType.SigmoidRenorm:
+        return config.scoring_func == "sigmoid" and config.renormalize
+    if method == RoutingMethodType.Sigmoid:
+        return config.scoring_func == "sigmoid" and not config.renormalize
+    return False
+
+
 # -------------------------------- TopK ---------------------------------------
 
 
@@ -715,15 +757,22 @@ class TopK(BaseFusedOp):
         )
 
     def bind_runner_backend(
-        self, runner_backend: Optional[MoeRunnerBackendLike]
+        self,
+        runner_backend: Optional[MoeRunnerBackendLike],
+        *,
+        routing_method_type: Optional[RoutingMethodType] = None,
     ) -> None:
         """Associate the owning experts once; repeating the same association is safe."""
         if self._runner_backend_bound:
-            if runner_backend != self.topk_config.runner_backend:
+            if (
+                runner_backend != self.topk_config.runner_backend
+                or routing_method_type != self.topk_config.routing_method_type
+            ):
                 raise RuntimeError("TopK cannot bind a different MoE runner backend.")
             return
         self._runner_backend_bound = True
         self.topk_config.runner_backend = runner_backend
+        self.topk_config.routing_method_type = routing_method_type
         self.topk_config.fused_gate_packed_ids &= (
             runner_backend is not None and runner_backend.is_flashinfer_mxfp4()
         )
@@ -733,6 +782,7 @@ class TopK(BaseFusedOp):
             output_format = TopKOutputFormat.TRITON_KERNEL
         elif runner_backend is not None and (
             runner_backend.is_flashinfer_trtllm()
+            and _can_bypass_trtllm_routing(self.topk_config)
             or runner_backend.is_flashinfer_mxfp4()
             and not self.is_fp4_experts
         ):
@@ -2764,6 +2814,7 @@ def select_experts(
     ):
         correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
 
+    fold_scale_after_routing = False
     num_routed_topk = top_k - num_shared_topk_slots
     # On aiter and on the per-rank shared-slot path, _post_process_topk_ids appends
     # the shared columns, so the router selects and renormalizes routed experts only.
@@ -2823,7 +2874,7 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
     elif torch_native and custom_routing_function is None:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        fold_scale_after_routing = True
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -2833,8 +2884,7 @@ def select_experts(
             scoring_func=scoring_func,
         )
     elif custom_routing_function is None:
-        if scoring_func not in ("sqrtsoftplus", "sigmoid"):
-            assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        fold_scale_after_routing = scoring_func not in ("sqrtsoftplus", "sigmoid")
 
         # The JIT route depends on GPU-only topk_sigmoid/topk_softmax imports
         _can_use_jit_kernel = not _is_cpu
@@ -2913,6 +2963,10 @@ def select_experts(
                 and expert_location_dispatch_info is None
                 and num_shared_topk_slots == 0
                 and not routing_overridden
+                and not (
+                    apply_routed_scaling_factor_on_output
+                    and routed_scaling_factor not in (None, 1.0)
+                )
             ):
                 num_experts = router_logits.shape[-1]
                 if num_experts & (num_experts - 1) == 0 and num_experts <= 512:
@@ -2942,7 +2996,10 @@ def select_experts(
                 scoring_func=scoring_func,
                 num_fused_shared_experts=num_shared_topk_slots_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                apply_routed_scaling_factor_on_output=(
+                    apply_routed_scaling_factor_on_output
+                    and not fold_scale_after_routing
+                ),
                 **_fused_topk_kwargs,
             )
     else:
@@ -2950,13 +3007,22 @@ def select_experts(
         # padded rows is garbage. That is fine because _post_process_topk_ids
         # below masks rows >= num_token_non_padded (-1 on CUDA, 0 + zeroed
         # weights on HIP) after the logical->physical remap.
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        fold_scale_after_routing = True
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=top_k_for_gate,
             renormalize=renormalize,
         )
+
+    if (
+        fold_scale_after_routing
+        and apply_routed_scaling_factor_on_output
+        and routed_scaling_factor is not None
+    ):
+        # Shared columns keep their own weight; only routed experts take this scale.
+        num_routed_for_gate = top_k_for_gate - num_shared_topk_slots_for_gate
+        topk_weights[:, :num_routed_for_gate] *= routed_scaling_factor
 
     if routing_overridden:
         # Benchmark-only: override gating with a balanced expert assignment (so
