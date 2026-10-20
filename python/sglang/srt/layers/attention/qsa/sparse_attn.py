@@ -26,6 +26,16 @@ def _get_best_config(total_q: int):
     return next(cfg for limit, cfg in table if total_q <= limit)
 
 
+def _ttft_best_config(total_q: int):
+    # The stock table only knows H20 and falls back to the L20 entry
+    # (BLOCK_N=16, warps=1, stages=2) for large batches. On SM120
+    # (RTX PRO 6000) (16, 2, 3) is ~18% faster for 1K-query prefill:
+    # same math, different MMA accumulation split.
+    if total_q > 512 and torch.cuda.get_device_capability()[0] == 12:
+        return (16, 2, 3)
+    return _get_best_config(total_q)
+
+
 @triton.jit
 def _sparse_gqa_prefill(
     q,
@@ -376,7 +386,7 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
     # from cu_q costs one GPU->CPU sync per layer.
     max_q = total_q
     block_m = max(16, triton.next_power_of_2(group_size))
-    block_n, warps, stages = _get_best_config(total_q)
+    block_n, warps, stages = _ttft_best_config(total_q)
     out = torch.empty_like(q)
     _sparse_gqa_chunk_prefill[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
         q,
