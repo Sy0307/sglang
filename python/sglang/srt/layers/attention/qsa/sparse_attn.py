@@ -371,7 +371,10 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
-    max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+    # The grid only needs an upper bound: rows past a request's q_end return
+    # early in the kernel, and total_q is already known on the host. Sizing it
+    # from cu_q costs one GPU->CPU sync per layer.
+    max_q = total_q
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
     out = torch.empty_like(q)
