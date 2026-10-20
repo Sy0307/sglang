@@ -39,7 +39,7 @@ def vision_topk(
         and expert_location_dispatch_info.ep_dispatch_algorithm == "fake"
     ):
         correction_bias_vl = torch.zeros_like(correction_bias_vl)
-    num_fused_shared_experts = config.num_fused_shared_experts
+    num_shared_topk_slots = config.num_shared_topk_slots
     use_mega_moe = get_moe_a2a_backend().is_megamoe()
     if is_cuda():
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
@@ -48,7 +48,7 @@ def vision_topk(
         # rescaled below would rewrite weights after the router.
         packed_topk = None
         if (
-            num_fused_shared_experts == 0
+            num_shared_topk_slots == 0
             and expert_location_dispatch_info is None
             and not use_mega_moe
             and config.runner_backend is not None
@@ -63,7 +63,7 @@ def vision_topk(
             correction_bias,
             topk=config.top_k,
             scoring_func="sqrtsoftplus",
-            num_fused_shared_experts=num_fused_shared_experts,
+            num_fused_shared_experts=num_shared_topk_slots,
             bias_alt=correction_bias_vl,
             input_ids=input_ids,
             bias_alt_token_id=moe.config.image_token_id,
@@ -97,19 +97,19 @@ def vision_topk(
             correction_bias,
         )
     # The shared slots appended below use the same layout as biased_grouped_topk_gpu.
-    topk_routed = config.top_k - num_fused_shared_experts
+    topk_routed = config.top_k - num_shared_topk_slots
     indices = (scores + bias).topk(topk_routed, dim=-1).indices
     weights = scores.gather(-1, indices)
     routed_sum = weights.sum(-1, keepdim=True, dtype=torch.float32)
-    if num_fused_shared_experts:
+    if num_shared_topk_slots:
         shared_ids = logits.shape[-1] + torch.arange(
-            num_fused_shared_experts, device=indices.device, dtype=indices.dtype
+            num_shared_topk_slots, device=indices.device, dtype=indices.dtype
         )
         indices = torch.cat(
             [indices, shared_ids.expand(indices.shape[0], -1)],
             dim=-1,
         )
-        weights = F.pad(weights, (0, num_fused_shared_experts))
+        weights = F.pad(weights, (0, num_shared_topk_slots))
         weights[:, topk_routed:] = routed_sum / config.routed_scaling_factor
     if config.renormalize and config.top_k > 1:
         weights = weights / (routed_sum + _RENORMALIZE_SUM_EPSILON)
@@ -148,13 +148,6 @@ def _finish_vision_topk(
         expert_location_dispatch_info=expert_location_dispatch_info,
         padded_rows_masked=padded_rows_masked,
     )
-    if (
-        use_mega_moe
-        and config.num_fused_shared_experts
-        and config.apply_routed_scaling_factor_on_output
-    ):
-        # MegaMoE applies no post-expert scale when it is already in top-k.
-        weights[:, -config.num_fused_shared_experts :] = 1.0
     if recorder_ids is not None:
         get_global_expert_distribution_recorder().on_select_experts(
             topk_ids=recorder_ids
@@ -162,7 +155,7 @@ def _finish_vision_topk(
     # Shared-slot remapping can overwrite padded weights; mask last so idle
     # and partially padded DP ranks never dispatch a phantom shared expert.
     if num_token_non_padded is not None and (
-        not padded_rows_masked or (use_mega_moe and config.num_fused_shared_experts)
+        not padded_rows_masked or (use_mega_moe and config.num_shared_topk_slots)
     ):
         _mask_topk_ids_padded_region(indices, num_token_non_padded)
         _zero_topk_weights_padded_region(weights, num_token_non_padded)

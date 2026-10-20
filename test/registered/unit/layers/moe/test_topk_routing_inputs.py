@@ -10,6 +10,7 @@ from sglang.srt.batch_overlap.operations import (
     ExecutionOperation,
     _StageExecutor,
 )
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
@@ -41,6 +42,7 @@ from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
+    get_model,
     get_parallel,
     get_resources,
 )
@@ -110,12 +112,16 @@ class TestTopKRoutingInputs(CustomTestCase):
         self.logits = torch.tensor([[9.0, 8.0, 1.0, 0.0]]).repeat(4, 1)
 
     def _router(self, **kwargs):
-        return TopK(
-            top_k=2,
-            layer_id=0,
-            custom_routing_function=fused_topk_torch_native,
-            **kwargs,
-        )
+        shared_slots = kwargs.pop("num_fused_shared_experts", 0)
+        with get_model().override(
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=shared_slots)
+        ):
+            return TopK(
+                top_k=2 - shared_slots,
+                layer_id=0,
+                custom_routing_function=fused_topk_torch_native,
+                **kwargs,
+            )
 
     def test_target_and_draft_remap_only_the_target_and_keep_mask(self):
         """Draft routes must not use the target placement or lose every live row."""
@@ -199,7 +205,7 @@ class TestTopKRoutingInputs(CustomTestCase):
         self.assertEqual(seen, [1, 3, 1, 3])
 
     def test_hash_router_uses_same_placement_and_bound(self):
-        router = HashTopK(2, 4, 0, 4, scoring_func="softmax", layer_id=0)
+        router = HashTopK(2, 4, vocab_size=4, scoring_func="softmax", layer_id=0)
         with envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
             with forward_context(
                 ForwardContext(attn_backend=object()), forward_batch=_batch(2)
@@ -474,7 +480,7 @@ class TestTopKRoutingInputs(CustomTestCase):
                         _ = output.router_logits
 
     def test_hash_npu_keeps_valid_ids_and_zero_padded_weights(self):
-        router = HashTopK(2, 4, 0, 4, scoring_func="softmax", layer_id=0)
+        router = HashTopK(2, 4, vocab_size=4, scoring_func="softmax", layer_id=0)
         with (
             patch.object(hash_topk_module, "_is_npu", True),
             envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False),
@@ -487,15 +493,17 @@ class TestTopKRoutingInputs(CustomTestCase):
         torch.testing.assert_close(output.topk_weights[2:], torch.zeros((2, 2)))
 
     def test_hash_global_shared_column_stays_outside_expert_map(self):
-        router = HashTopK(
-            3,
-            4,
-            1,
-            4,
-            scoring_func="sqrtsoftplus",
-            routed_scaling_factor=2.0,
-            layer_id=0,
-        )
+        with get_model().override(
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
+        ):
+            router = HashTopK(
+                2,
+                4,
+                vocab_size=4,
+                scoring_func="sqrtsoftplus",
+                routed_scaling_factor=2.0,
+                layer_id=0,
+            )
         with envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
             with forward_context(
                 ForwardContext(attn_backend=object()), forward_batch=_batch(2)

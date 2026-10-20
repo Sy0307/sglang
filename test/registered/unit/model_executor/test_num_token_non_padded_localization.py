@@ -22,7 +22,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -36,6 +36,15 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_local_num_token_non_padded,
     compute_local_num_token_non_padded_cpu,
     enable_num_token_non_padded,
+)
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_forward_context,
+    has_forward_context,
+)
+from sglang.srt.model_executor.runner.row_bucket_graph_runner import (
+    RowBucketGraphRunner,
 )
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.communicator_patch import patch_communicator
@@ -252,6 +261,62 @@ class TestEnableNumTokenNonPadded(CustomTestCase):
                 get_flags().dp.override(use_world_group_for_gather=False),
             ):
                 self.assertIs(enable_num_token_non_padded(), expected)
+
+
+class TestRowBucketMoeBound(CustomTestCase):
+    def test_capture_owns_the_moe_bound_and_restores_the_outer_context(self):
+        """A bucket's recorded routing must retain its own mutable count buffer."""
+        for active_context in (False, True):
+            with (
+                self.subTest(active_context=active_context),
+                get_parallel().override(attn_dp_size=1, attn_cp_size=1),
+                sparse_moe_input("local"),
+            ):
+                outer_batch = _forward_batch(sharded=False, local=3, glob=3)
+                outer = ForwardContext(attn_backend=None)
+                scope = (
+                    forward_context(outer, forward_batch=outer_batch)
+                    if active_context
+                    else nullcontext()
+                )
+                observed = []
+
+                def body(inputs, capture_batch):
+                    if active_context:
+                        bound = get_forward_context().moe_num_token_non_padded()
+                        self.assertIs(bound, capture_batch.num_token_non_padded)
+                        observed.append(bound)
+                    else:
+                        self.assertFalse(has_forward_context())
+                    return inputs
+
+                def record(body, rows, count, batch, start, free_before):
+                    body()
+                    return SimpleNamespace(batch=(), num_token_non_padded=count)
+
+                runner = RowBucketGraphRunner(row_step=8, max_rows=8, label="test")
+                with (
+                    scope,
+                    patch.object(torch.cuda, "mem_get_info", return_value=(1, 2)),
+                    patch.object(runner, "_record", side_effect=record),
+                ):
+                    graph = runner._capture(
+                        8,
+                        3,
+                        [torch.zeros(8, 1)],
+                        outer_batch,
+                        body,
+                        lambda batch, inputs: nullcontext(),
+                    )
+                    graph.num_token_non_padded.fill_(7)
+                    outer_batch.num_token_non_padded.fill_(1)
+                    if active_context:
+                        self.assertEqual(int(observed[0]), 7)
+                        self.assertIs(
+                            get_forward_context().moe_num_token_non_padded(),
+                            outer_batch.num_token_non_padded,
+                        )
+                self.assertFalse(has_forward_context())
 
 
 if __name__ == "__main__":

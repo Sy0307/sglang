@@ -21,9 +21,9 @@ class TestFusedMOE(CustomTestCase):
 
     def setUp(self):
         super().setUp()
-        config = get_context().override_server_args()
-        config.install()
-        self.addCleanup(config.restore)
+        context_override = get_context().override_server_args()
+        context_override.install()
+        self.addCleanup(context_override.restore)
 
     @staticmethod
     def create_random_cuda_tensor(shape, dtype, mean=0, std=0.01):
