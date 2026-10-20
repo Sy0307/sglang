@@ -261,6 +261,9 @@ class SchedulerBatchResultProcessor:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        # Radix-tree checkpoints of still-running requests are taken after
+        # their first token has been streamed.
+        deferred_checkpoints = []
         self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
@@ -391,9 +394,7 @@ class SchedulerBatchResultProcessor:
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        checkpoint_kv_cache(req, self.tree_cache)
-                        if get_memory().enable_hisparse:
-                            self.hisparse_coordinator.admit_request_into_staging(req)
+                        deferred_checkpoints.append(req)
 
                     if discard_finish_reason is None:
                         self._maybe_collect_customized_info(i, req, logits_output)
@@ -502,6 +503,13 @@ class SchedulerBatchResultProcessor:
         self.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req
         )
+        if deferred_checkpoints:
+            self.token_to_kv_pool_allocator.free_group_begin()
+            for req in deferred_checkpoints:
+                checkpoint_kv_cache(req, self.tree_cache)
+                if get_memory().enable_hisparse:
+                    self.hisparse_coordinator.admit_request_into_staging(req)
+            self.token_to_kv_pool_allocator.free_group_end()
 
         can_run_cuda_graph = result.can_run_cuda_graph
         # None on decode->extend converted batches; they are decode work and
