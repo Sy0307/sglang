@@ -1350,10 +1350,13 @@ def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Te
     (optionally pinned) CPU; H2D is the caller's job.
     """
     combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
-    cpu_t = torch.from_numpy(combined)
-    if pin:
-        cpu_t = cpu_t.pin_memory()
-    return cpu_t
+    if not pin:
+        return torch.from_numpy(combined)
+    # A pinned block from the caching host allocator, filled in place: the
+    # same result as from_numpy(...).pin_memory() without its pointer query.
+    out = torch.empty(combined.shape[0], dtype=torch.int64, pin_memory=True)
+    out.numpy()[:] = combined
+    return out
 
 
 def flatten_arrays_to_int64_tensor(
