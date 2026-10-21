@@ -13,6 +13,12 @@ from sglang.srt.environ import (
 
 _redirect_third_party_caches()
 
+# TTFT patches for the Flash-Next fork branch. No-op unless SGLANG_TTFT_PATCH is set.
+import os as _os
+
+if _os.environ.get("SGLANG_TTFT_PATCH"):
+    from sglang.srt.ttft import patches as _ttft_patches  # noqa: F401
+
 if _sys.platform == "darwin" and _platform.machine() == "arm64":
     from sglang._platform_stubs import install_platform_stubs as _install_platform_stubs
 
