@@ -464,6 +464,21 @@ pub struct GenerateMetaInfo {
     /// on the terminal frame.
     #[prost(double, optional, tag = "12")]
     pub e2e_latency: ::core::option::Option<f64>,
+    /// Prompt tokens served from the prefix cache (Python `cached_tokens`).
+    #[prost(uint32, tag = "13")]
+    pub cached_tokens: u32,
+    /// Output tokens up to and including the reasoning end marker.
+    #[prost(uint32, tag = "14")]
+    pub reasoning_tokens: u32,
+    #[prost(uint32, tag = "15")]
+    pub num_retractions: u32,
+    /// `--weight-version`; when set, `weight_versions` reports one span over the output.
+    #[prost(string, optional, tag = "16")]
+    pub weight_version: ::core::option::Option<::prost::alloc::string::String>,
+    /// Wall-clock seconds when the request's first frame was sent (Python's
+    /// `response_sent_to_client_ts`): the first stream frame, or the unary reply.
+    #[prost(double, optional, tag = "17")]
+    pub response_sent_to_client_ts: ::core::option::Option<f64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateResponse {

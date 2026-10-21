@@ -9,8 +9,12 @@ use sglang_api_types::api::v1 as api;
 
 use super::CoreError;
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
-use crate::message::response::{ChunkEvent, ChunkExtras};
+use crate::message::response::{ChunkEvent, ChunkExtras, ChunkMeta};
 use crate::message::types::TokenIds;
+
+/// The server's `--weight-version`, reported in every `meta_info` like Python's
+/// TokenizerManager does; set once when the HTTP app starts.
+pub(crate) static WEIGHT_VERSION: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// Canonical transport-neutral output payload for generation events.
 ///
@@ -24,6 +28,7 @@ pub(crate) struct CoreOutput {
     pub(crate) token_ids: TokenIds,
     pub(crate) finish_reason: Option<FinishReason>,
     pub(crate) prompt_tokens: u32,
+    pub(crate) meta: ChunkMeta,
     pub(crate) text: String,
     pub(crate) completion_tokens: u64,
     pub(crate) extras: Option<Box<ChunkExtras>>,
@@ -36,6 +41,7 @@ impl From<ChunkEvent> for CoreOutput {
             token_ids,
             finish_reason,
             prompt_tokens,
+            meta,
             text,
             completion_tokens,
             extras,
@@ -44,6 +50,7 @@ impl From<ChunkEvent> for CoreOutput {
             token_ids,
             finish_reason,
             prompt_tokens,
+            meta,
             text,
             completion_tokens,
             extras,
@@ -63,6 +70,7 @@ impl CoreOutput {
         self.token_ids.extend_from_slice(&delta.token_ids);
         self.completion_tokens += delta.completion_tokens;
         self.prompt_tokens = delta.prompt_tokens;
+        self.meta = delta.meta;
         if delta.finish_reason.is_some() {
             self.finish_reason = delta.finish_reason.clone();
         }
@@ -196,6 +204,10 @@ impl CoreOutput {
             completion_tokens: self.completion_tokens,
             finish_reason: self.finish_reason.as_ref().map(finish_reason),
             e2e_latency,
+            cached_tokens: self.meta.cached_tokens,
+            reasoning_tokens: self.meta.reasoning_tokens,
+            num_retractions: self.meta.num_retractions,
+            weight_version: WEIGHT_VERSION.get().cloned().flatten(),
             ..Default::default()
         };
         let Some(extras) = self.extras.as_deref() else {

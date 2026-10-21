@@ -17,7 +17,8 @@ use super::wire::{
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 use crate::think::{ReasoningOptions, ThinkConfig, ThinkDetector, think_config};
-use crate::tool_call::{ToolCallItem, ToolDetector, tool_call_id, tool_detector};
+use crate::tool_call::structural_tag::qwen3_coder_constraint;
+use crate::tool_call::{ToolCallItem, ToolDetector, ToolSpec, tool_call_id, tool_detector_for};
 
 /// Facts about the served model that Python's chat layer reads.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -149,6 +150,26 @@ pub fn lower_chat(
     render: impl FnOnce(&Value) -> Option<Vec<u32>>,
     tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
 ) -> Result<(Value, ChatResponder), Unsupported> {
+    let render = |request: &Value| render(request).map(Prompt::Ids);
+    lower_chat_prompt(body, headers, settings, model, render, tokenizer)
+}
+
+/// A rendered chat prompt: token ids, or text the host's `/generate` encodes
+/// without adding special tokens (as Python's chat path encodes it).
+pub enum Prompt {
+    Ids(Vec<u32>),
+    Text(String),
+}
+
+/// [`lower_chat`] for a host that renders the prompt to either form.
+pub fn lower_chat_prompt(
+    body: &[u8],
+    headers: &OpenAiHeaders<'_>,
+    settings: &OpenAiSettings,
+    model: &ChatModel,
+    render: impl FnOnce(&Value) -> Option<Prompt>,
+    tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
+) -> Result<(Value, ChatResponder), Unsupported> {
     let original: Value =
         serde_json::from_slice(body).map_err(|_| Unsupported("unparsed_request"))?;
     let Value::Object(mut raw) = original.clone() else {
@@ -172,11 +193,11 @@ pub fn lower_chat(
         Some(name) => Some(think_config(name).ok_or(Unsupported("reasoning_parser"))?),
         None => None,
     };
-    let tools = request_tools(&raw)?;
-    let tool_names = match (settings.tool_call_parser.as_deref(), &tools) {
-        (Some(parser), Some(names)) => {
-            tool_detector(parser, names.clone()).ok_or(Unsupported("tool_parser"))?;
-            Some((parser.to_owned(), names.clone()))
+    let tools = request_tools(&raw, settings.tool_call_parser.as_deref())?;
+    let tool_specs = match (settings.tool_call_parser.as_deref(), &tools.parse) {
+        (Some(parser), Some(specs)) => {
+            tool_detector_for(parser, specs.clone()).ok_or(Unsupported("tool_parser"))?;
+            Some((parser.to_owned(), specs.clone()))
         }
         _ => None,
     };
@@ -202,7 +223,7 @@ pub fn lower_chat(
     if request.logprobs && tokenizer.is_none() {
         return Err(Unsupported("no_tokenizer"));
     }
-    let prompt_ids = render(&original).ok_or(Unsupported("render"))?;
+    let prompt = render(&original).ok_or(Unsupported("render"))?;
 
     // `_process_messages`: the server's default kwargs fill in the request's.
     let mut kwargs = request.chat_template_kwargs.take().unwrap_or_default();
@@ -214,10 +235,21 @@ pub fn lower_chat(
     for (key, value) in settings.default_chat_template_kwargs.iter().flatten() {
         kwargs.entry(key.clone()).or_insert_with(|| value.clone());
     }
-    let thinking = parser.is_some() && kwargs.get("thinking") == Some(&Value::Bool(true));
+    // `_get_reasoning_from_request`: a default-on toggle is on unless set
+    // `False`; a default-off one only when set `True`.
+    let thinking = parser.is_some_and(|config| match config.toggle {
+        (key, true) => kwargs.get(key) != Some(&Value::Bool(false)),
+        (key, false) => kwargs.get(key) == Some(&Value::Bool(true)),
+    });
     // `_process_messages`: tool output keeps the parser's special tokens.
-    if tools.is_some() {
+    if tools.active {
         request.skip_special_tokens = false;
+    }
+    // `to_sampling_params`: a tool constraint cannot join another output constraint.
+    if tools.constraint.is_some()
+        && (request.regex.is_some() || request.ebnf.is_some() || request.response_format.is_some())
+    {
+        return Err(Unsupported("tool_constraint_conflict"));
     }
     let previous_content = match request.messages.last() {
         Some(last)
@@ -236,9 +268,12 @@ pub fn lower_chat(
         _ => None,
     };
 
-    let lowered = generate_body(
-        &request, &kwargs, model, prompt_ids, thinking, headers, settings,
+    let mut lowered = generate_body(
+        &request, &kwargs, model, prompt, thinking, headers, settings,
     );
+    if let Some(constraint) = tools.constraint {
+        lowered["sampling_params"]["structural_tag"] = constraint.into();
+    }
     let (include_usage, continuous_usage_stats) =
         usage_flags(request.stream_options.as_ref(), settings);
     let reasoning = parser
@@ -258,7 +293,7 @@ pub fn lower_chat(
         n: request.n as usize,
         logprobs: request.logprobs,
         reasoning,
-        tools: tool_names,
+        tools: tool_specs,
         include_usage,
         continuous_usage_stats,
         settings: settings.clone(),
@@ -273,30 +308,47 @@ pub fn lower_chat(
     Ok((lowered, responder))
 }
 
-/// The names of the tools a request lets the model call, or `None` when
-/// `tool_choice` turns them off. Only `auto` without strict tools is served:
-/// it adds no constraint, while the others depend on the engine's xgrammar.
-fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupported> {
+/// What a request's tools change: whether tools are on, the tools whose calls
+/// are parsed out of the output, and the `structural_tag` that constrains them.
+struct RequestTools {
+    /// `effective_tools and tool_choice != "none"`.
+    active: bool,
+    parse: Option<Vec<ToolSpec>>,
+    constraint: Option<String>,
+}
+
+/// `_process_messages`' tool handling. `auto` without strict tools adds no
+/// constraint; `required`, a named tool and strict tools get xgrammar's
+/// structural tag, which is reproduced for Qwen3-Coder only.
+fn request_tools(
+    raw: &Map<String, Value>,
+    tool_parser: Option<&str>,
+) -> Result<RequestTools, Unsupported> {
     let choice = raw.get("tool_choice").filter(|c| !c.is_null());
-    if choice.is_some_and(|c| c != "auto" && c != "none")
+    let qwen3_coder = tool_parser == Some("qwen3_coder");
+    let constrained_choice = choice.is_some_and(|c| c != "auto" && c != "none");
+    if (constrained_choice && !(qwen3_coder && (c_is_required(choice) || c_is_named(choice))))
         || raw
             .get("parallel_tool_calls")
             .is_some_and(|p| !p.is_boolean())
     {
         return Err(Unsupported("tool_choice"));
     }
+    let off = RequestTools { active: false, parse: None, constraint: None };
     let tools = match raw.get("tools") {
-        None | Some(Value::Null) => return Ok(None),
+        None | Some(Value::Null) => return Ok(off),
         Some(Value::Array(tools)) => tools,
         Some(_) => return Err(Unsupported("invalid_request")),
     };
-    let mut names = Vec::with_capacity(tools.len());
+    let mut specs = Vec::with_capacity(tools.len());
     for tool in tools {
         let function = &tool["function"];
         let well_formed = tool.get("type").is_none_or(Value::is_string)
             && tool.get("defer_loading").is_none_or(Value::is_null)
             && function.get("defer_loading").is_none_or(Value::is_null)
-            && function.get("strict").is_none_or(|s| s == false)
+            && function
+                .get("strict")
+                .is_none_or(|s| s == false || (qwen3_coder && s == true))
             && function
                 .get("description")
                 .is_none_or(|d| d.is_string() || d.is_null())
@@ -304,10 +356,30 @@ fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupp
         let (true, Some(name)) = (well_formed, function["name"].as_str()) else {
             return Err(Unsupported("tool_definition"));
         };
-        names.push(name.to_owned());
+        specs.push(ToolSpec {
+            name: name.to_owned(),
+            parameters: function.get("parameters").filter(|p| !p.is_null()).cloned(),
+        });
     }
-    let parse = !tools.is_empty() && choice.is_none_or(|c| c == "auto");
-    Ok(parse.then_some(names))
+    let active = !tools.is_empty() && choice.is_none_or(|c| c != "none");
+    if !active {
+        return Ok(off);
+    }
+    let parallel = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
+    let constraint = match qwen3_coder {
+        true => qwen3_coder_constraint(tools, choice, parallel)
+            .map_err(|()| Unsupported("invalid_request"))?,
+        false => None,
+    };
+    Ok(RequestTools { active, parse: Some(specs), constraint })
+}
+
+fn c_is_required(choice: Option<&Value>) -> bool {
+    choice.is_some_and(|c| c == "required")
+}
+
+fn c_is_named(choice: Option<&Value>) -> bool {
+    choice.is_some_and(|c| c.get("function").and_then(|f| f.get("name")).is_some_and(Value::is_string))
 }
 
 const SCHEMA_TYPES: &[&str] = &[
@@ -559,7 +631,7 @@ fn generate_body(
     request: &ChatRequest,
     kwargs: &Map<String, Value>,
     model: &ChatModel,
-    prompt_ids: Vec<u32>,
+    prompt: Prompt,
     thinking: bool,
     headers: &OpenAiHeaders<'_>,
     settings: &OpenAiSettings,
@@ -605,8 +677,8 @@ fn generate_body(
     if let Ok(Some(schema)) = format_json_schema(request.response_format.as_ref()) {
         sampling["json_schema"] = schema.into();
     }
-    json!({
-        "input_ids": prompt_ids,
+    let mut body = json!({
+        "input_ids": null,
         "image_data": null,
         "video_data": null,
         "audio_data": null,
@@ -644,7 +716,15 @@ fn generate_body(
         "max_dynamic_patch": null,
         "use_audio_in_video": false,
         "return_prompt_token_ids": false,
-    })
+    });
+    match prompt {
+        Prompt::Ids(ids) => body["input_ids"] = ids.into(),
+        Prompt::Text(text) => {
+            body.as_object_mut().expect("an object").remove("input_ids");
+            body["text"] = text.into();
+        }
+    }
+    body
 }
 
 struct ReasoningConfig {
@@ -658,8 +738,8 @@ pub struct ChatResponder {
     n: usize,
     logprobs: bool,
     reasoning: Option<ReasoningConfig>,
-    /// The tool parser and tool names when the output is parsed for tool calls.
-    tools: Option<(String, Vec<String>)>,
+    /// The tool parser and tools when the output is parsed for tool calls.
+    tools: Option<(String, Vec<ToolSpec>)>,
     include_usage: bool,
     continuous_usage_stats: bool,
     settings: OpenAiSettings,
@@ -696,8 +776,8 @@ impl ChatResponder {
             // `_process_tool_calls`.
             let mut finish_reason = meta["finish_reason"].clone();
             let mut tool_calls = Value::Null;
-            if let Some((parser, names)) = &self.tools
-                && let Some(detector) = tool_detector(parser, names.clone())
+            if let Some((parser, specs)) = &self.tools
+                && let Some(detector) = tool_detector_for(parser, specs.clone())
                 && detector.has_tool_call(&text)
             {
                 let (normal, calls) = detector.parse_non_stream(&text);
@@ -715,14 +795,19 @@ impl ChatResponder {
                 }
             }
             let finish_reason = &finish_reason;
+            let mut message = json!({
+                "role": "assistant",
+                "content": text,
+                "reasoning_content": (!reasoning.is_empty()).then_some(reasoning),
+                "tool_calls": tool_calls,
+            });
+            // `ChatMessage._serialize` drops a `None` `tool_calls`.
+            if message["tool_calls"].is_null() {
+                message.as_object_mut().expect("an object").remove("tool_calls");
+            }
             choices.push(json!({
                 "index": index,
-                "message": {
-                    "role": "assistant",
-                    "content": text,
-                    "reasoning_content": (!reasoning.is_empty()).then_some(reasoning),
-                    "tool_calls": tool_calls,
-                },
+                "message": message,
                 "logprobs": logprobs,
                 "finish_reason": finish_reason.get("type"),
                 "matched_stop": finish_reason.get("matched"),
@@ -854,11 +939,15 @@ impl ChatResponder {
             let flush = finish_type.as_deref().is_some_and(|t| t != "abort");
             let tools = self.tools.as_ref().expect("tools are set");
             let detector = self.tool_detectors.entry(index).or_insert_with(|| {
-                tool_detector(&tools.0, tools.1.clone()).expect("checked when lowering")
+                tool_detector_for(&tools.0, tools.1.clone()).expect("checked when lowering")
             });
             let (normal, calls) = detector.parse_stream(&delta, flush);
             let usage = self.chunk_usage(index).unwrap_or(Value::Null);
-            let delta = |content: Value, tool_calls: Value| json!({"role": null, "content": content, "reasoning_content": null, "tool_calls": tool_calls});
+            // `DeltaMessage` drops a `None` `tool_calls`, as `ChatMessage` does.
+            let delta = |content: Value, tool_calls: Value| match tool_calls.is_null() {
+                true => json!({"role": null, "content": content, "reasoning_content": null}),
+                false => json!({"role": null, "content": content, "reasoning_content": null, "tool_calls": tool_calls}),
+            };
             if !normal.is_empty() {
                 let mut chunk =
                     self.chunk_json(index, delta(normal.into(), Value::Null), None, None);

@@ -35,6 +35,9 @@ pub(crate) struct ThinkConfig {
     pub end: &'static str,
     pub tool_start: Option<&'static str>,
     pub tool_start_at_line_start: bool,
+    /// The chat-template kwarg that turns reasoning on, and whether it is on
+    /// when the request leaves it unset (`_get_reasoning_from_request`).
+    pub toggle: (&'static str, bool),
 }
 
 /// Streaming and one-shot `<think>` splitting, as SGLang's base detector does it.

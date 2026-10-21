@@ -14,7 +14,7 @@ mod wire;
 
 use serde::Deserialize;
 
-pub use chat::{ChatModel, ChatResponder, lower_chat};
+pub use chat::{ChatModel, ChatResponder, Prompt, lower_chat, lower_chat_prompt};
 pub use completions::{CompletionResponder, lower_completion};
 pub use pieces::TokenPieces;
 pub use wire::Reply;

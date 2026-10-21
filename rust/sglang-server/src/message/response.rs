@@ -179,6 +179,25 @@ pub struct BatchHeader {
     pub hidden_reqlens: Vec<u32>,
     #[serde(default)]
     pub hidden_poslens: Vec<u32>,
+    /// Per-request scalars behind the twelve extras columns (the producer pads
+    /// those with empty lists to reach them): Python's meta_info `cached_tokens`,
+    /// `reasoning_tokens` and `num_retractions`. Empty from a producer that does
+    /// not send them; they then read as zero.
+    #[serde(default)]
+    pub cached_tokens: Vec<u32>,
+    #[serde(default)]
+    pub reasoning_tokens: Vec<u32>,
+    #[serde(default)]
+    pub retractions: Vec<u32>,
+}
+
+/// The per-request scalars a frame carries besides tokens and logprobs. Each is the
+/// scheduler's current (cumulative) value, so the latest frame wins.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkMeta {
+    pub cached_tokens: u32,
+    pub reasoning_tokens: u32,
+    pub num_retractions: u32,
 }
 
 /// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
@@ -290,6 +309,9 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || !per_req_ok(&h.out_tokids_lp_reqlens)
         || !per_req_ok(&h.in_tokids_lp_reqlens)
         || !per_req_ok(&h.hidden_reqlens)
+        || !per_req_ok(&h.cached_tokens)
+        || !per_req_ok(&h.reasoning_tokens)
+        || !per_req_ok(&h.retractions)
     {
         reject!()
     }
@@ -465,6 +487,11 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
+            meta: ChunkMeta {
+                cached_tokens: h.cached_tokens.get(i).copied().unwrap_or(0),
+                reasoning_tokens: h.reasoning_tokens.get(i).copied().unwrap_or(0),
+                num_retractions: h.retractions.get(i).copied().unwrap_or(0),
+            },
             extras,
             // Listed explicitly, NOT `..Default::default()`: a new column added to
             // `ChunkEvent` and wired into the response must fail to compile here
@@ -568,6 +595,8 @@ pub struct ChunkEvent {
     pub finish_reason: Option<FinishReason>,
     /// Prompt token count for this request (constant across its chunks).
     pub prompt_tokens: u32,
+    /// Cached-prefix / reasoning-token / retraction counts as of this chunk.
+    pub meta: ChunkMeta,
     /// Decoded text **delta** for this chunk (empty in skip mode / on partial UTF-8),
     /// filled by the detok shard. `token_ids` doubles as `output_ids`;
     /// `completion_tokens` is this chunk's count.

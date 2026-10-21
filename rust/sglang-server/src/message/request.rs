@@ -360,6 +360,8 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
             decode_tp_size,
             routed_dp_rank,
             disagg_prefill_dp_rank,
+            // Native `/generate` never asks; the chat flow sets it.
+            require_reasoning: false,
             mm: pack_mm(image_data, video_data, audio_data),
             mm_buffers: Vec::new(),
         },
@@ -502,6 +504,9 @@ pub struct GenerateRequest {
     /// so these are pure passthrough for the scheduler/LB protocol.
     pub routed_dp_rank: Option<i64>,
     pub disagg_prefill_dp_rank: Option<i64>,
+    /// The output starts in a reasoning block that the grammar backend lets run
+    /// unconstrained (Python `GenerateReqInput.require_reasoning`; set by chat).
+    pub require_reasoning: bool,
     /// Multimodal inputs. Consumed by the Encoding stage, which ships them to
     /// the MM worker pool; never read by the tokenizer or serialized onto the
     /// scheduler header. Boxed so the common text-only request doesn't grow

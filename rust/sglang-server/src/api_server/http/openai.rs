@@ -11,6 +11,7 @@ use std::sync::Arc;
 mod chat;
 mod completions;
 mod models;
+pub(super) mod parity;
 mod pd_routing;
 mod template;
 mod template_builtins;

@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
-use crate::message::io_struct::{ControlRequest, GetInternalStateReq};
+use crate::message::io_struct::{ControlRequest, FlushCacheReqInput, GetInternalStateReq};
 use crate::message::request::{GenerateRequest, Request, RequestKind};
 use crate::message::response::{ResponseItem, ResponseSink};
 use crate::message::sampling::SamplingParams;
@@ -214,6 +214,22 @@ impl CoreHandle {
             .map(|response| response.internal_state)
             .map_err(|error| {
                 CoreError::InvalidResponse(format!("invalid internal-state response: {error}"))
+            })
+    }
+
+    /// Flush the scheduler's prefix cache. `Ok((success, message))` carries the
+    /// scheduler's verdict (it refuses while requests are running or waiting).
+    pub(crate) async fn flush_cache(&self, timeout_s: Option<f64>) -> Result<(bool, String), CoreError> {
+        let bytes = self
+            .control(ControlRequest::FlushCacheReqInput(FlushCacheReqInput::new(
+                Rid::new().to_string(),
+                timeout_s,
+            )))
+            .await?;
+        rmp_serde::from_slice::<FlushCacheEnvelope>(&bytes)
+            .map(|response| (response.success, response.message))
+            .map_err(|error| {
+                CoreError::InvalidResponse(format!("invalid flush-cache response: {error}"))
             })
     }
 
@@ -509,6 +525,14 @@ fn generation_event(item: ResponseItem) -> CoreEvent {
 
 /// Private scheduler response envelope. This MessagePack shape is decoded at
 /// the runtime boundary and deliberately is not part of the core contract.
+/// The scheduler's `FlushCacheReqOutput`, as `push_control_output` names it.
+#[derive(serde::Deserialize)]
+struct FlushCacheEnvelope {
+    success: bool,
+    #[serde(default)]
+    message: String,
+}
+
 #[derive(serde::Deserialize)]
 struct InternalStateEnvelope {
     #[serde(default)]

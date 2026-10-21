@@ -8,6 +8,7 @@ pub(super) const THINK: ThinkConfig = ThinkConfig {
     end: "</think>",
     tool_start: Some("<｜DSML｜tool_calls>"),
     tool_start_at_line_start: true,
+    toggle: ("thinking", false),
 };
 
 /// V4.1's tool-call anchor is the spaced `<｜DSML｜ calls>` tag.

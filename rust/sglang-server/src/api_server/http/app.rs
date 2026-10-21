@@ -65,6 +65,8 @@ pub async fn serve(
     // aborted with the api runtime.
     shutdown: flume::Receiver<()>,
 ) {
+    let _ = crate::api_server::core::WEIGHT_VERSION.set(server_args.weight_version.clone());
+    openai::parity::init(&server_args);
     let chat_formatter = openai::load_chat_support(&server_args);
     let state = Arc::new(AppState {
         core,

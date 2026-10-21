@@ -53,6 +53,9 @@ wire_struct! {
         decode_tp_size: Option<i64>,
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
+        /// Not sent by this server; nil keeps `require_reasoning` on its index.
+        routing_key: (),
+        require_reasoning: bool,
     }
 }
 
@@ -71,6 +74,11 @@ control_messages! {
 
     /// `/server_info`'s control request: a bare `BaseReq` with no extra fields.
     GetInternalStateReq {}
+
+    /// `/flush_cache`'s control request (Python `FlushCacheReqInput`).
+    FlushCacheReqInput {
+        timeout_s: Option<f64>,
+    }
 }
 
 /// Borrow a request as its wire struct, resolving `Option` scalars to the wire
@@ -114,6 +122,8 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             decode_tp_size: req.decode_tp_size,
             routed_dp_rank: req.routed_dp_rank,
             disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
+            routing_key: (),
+            require_reasoning: req.require_reasoning,
         }
     }
 }
@@ -121,6 +131,12 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
 impl GetInternalStateReq {
     pub fn new(rid: String) -> Self {
         Self { rid }
+    }
+}
+
+impl FlushCacheReqInput {
+    pub fn new(rid: String, timeout_s: Option<f64>) -> Self {
+        Self { rid, timeout_s }
     }
 }
 
@@ -180,9 +196,9 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 32 (through
-        // `disagg_prefill_dp_rank`). Trailing defaulted fields are omitted.
-        assert_eq!(arr.len(), 32, "header ends at disagg_prefill_dp_rank");
+        // msgspec requires >= 14 (through `stream`); we emit 34 (through
+        // `require_reasoning`). Trailing defaulted fields are omitted.
+        assert_eq!(arr.len(), 34, "header ends at require_reasoning");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");

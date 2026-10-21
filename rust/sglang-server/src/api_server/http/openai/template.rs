@@ -43,9 +43,35 @@ impl ChatFormatter {
         request: &CreateChatCompletionRequest,
         kwargs: Option<&ChatTemplateKwargs>,
     ) -> Result<String, TemplateError> {
+        self.render_inner(request, kwargs, None)
+    }
+
+    /// [`Self::render`] with the template's `tools` as Python's `_process_messages`
+    /// passes them: `Tool.model_dump()` of the tools it keeps (`None` for none),
+    /// rather than as the request spelled them.
+    pub(super) fn render_with_tools(
+        &self,
+        request: &CreateChatCompletionRequest,
+        kwargs: Option<&ChatTemplateKwargs>,
+        tools: Option<Vec<serde_json::Value>>,
+    ) -> Result<String, TemplateError> {
+        let tools = tools.map(|tools| minijinja::Value::from_serialize(&tools));
+        self.render_inner(request, kwargs, Some(tools))
+    }
+
+    fn render_inner(
+        &self,
+        request: &CreateChatCompletionRequest,
+        kwargs: Option<&ChatTemplateKwargs>,
+        tools: Option<Option<minijinja::Value>>,
+    ) -> Result<String, TemplateError> {
         match self {
             ChatFormatter::HuggingFace(PromptFormatter::OAI(formatter)) => formatter
-                .render(&TemplateRequest { request, kwargs })
+                .render(&TemplateRequest {
+                    request,
+                    kwargs,
+                    tools,
+                })
                 .map_err(|error| TemplateError::Renderer {
                     message: error.to_string(),
                 }),
@@ -70,6 +96,8 @@ impl ChatFormatter {
 struct TemplateRequest<'a> {
     request: &'a CreateChatCompletionRequest,
     kwargs: Option<&'a ChatTemplateKwargs>,
+    /// The template's `tools`, when the caller decides them.
+    tools: Option<Option<minijinja::Value>>,
 }
 
 impl OAIChatLikeRequest for TemplateRequest<'_> {
@@ -83,7 +111,10 @@ impl OAIChatLikeRequest for TemplateRequest<'_> {
         self.request.typed_messages()
     }
     fn tools(&self) -> Option<minijinja::Value> {
-        self.request.tools()
+        match &self.tools {
+            Some(tools) => tools.clone(),
+            None => self.request.tools(),
+        }
     }
     fn tool_choice(&self) -> Option<minijinja::Value> {
         self.request.tool_choice()

@@ -214,6 +214,84 @@ async fn generate(
     }
 }
 
+/// What a `/generate` body produced, for the OpenAI chat bridge: the unary JSON
+/// body as `/generate` answers it, or the stream's SSE `data` payloads
+/// (`[DONE]` last).
+pub(super) enum NativeOutput {
+    Unary { status: StatusCode, body: Vec<u8> },
+    Stream(futures::stream::BoxStream<'static, String>),
+}
+
+/// Run a `/generate` body as [`generate`] does, but hand back its output rather
+/// than an HTTP response. `rendered_prompt`: the text is a chat-template
+/// rendering that holds its own special tokens (Python's
+/// `add_special_tokens=False`); `require_reasoning` is chat's.
+pub(super) async fn run_generate(
+    state: &AppState,
+    mut body: serde_json::Value,
+    rendered_prompt: bool,
+    require_reasoning: bool,
+) -> Result<NativeOutput, Response> {
+    if let Some(preferred) = &state.server_args.preferred_sampling_params
+        && let Err(error) = merge_preferred_sampling(&mut body, &preferred.0)
+    {
+        return Err(native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, false));
+    }
+    let body: api::GenerateRequest = serde_json::from_value(body)
+        .map_err(|error| native_error(StatusCode::BAD_REQUEST, &error.to_string(), false))?;
+    let stream = body.stream.unwrap_or(false);
+    let (mut payloads, is_batch) = match into_requests(body) {
+        Ok(v) => v,
+        Err(e) => {
+            let body = serde_json::to_vec(&error_value(StatusCode::BAD_REQUEST.as_u16(), &e.to_string()))
+                .unwrap_or_default();
+            return Ok(NativeOutput::Unary { status: StatusCode::BAD_REQUEST, body });
+        }
+    };
+    for payload in &mut payloads {
+        payload.skip_special_tokens |= rendered_prompt;
+        payload.require_reasoning = require_reasoning;
+    }
+    let timing = RequestTiming::new();
+    let calls: Vec<(CoreCall, RequestTiming)> = if is_batch {
+        match state.core.generate_batch(payloads).await {
+            Ok(calls) => calls.into_iter().map(|call| (call, timing.clone())).collect(),
+            Err(error) => return Err(native_core_error(error, stream)),
+        }
+    } else {
+        let payload = payloads.into_iter().next().expect("into_requests yields >=1 payload");
+        match state.core.generate(payload).await {
+            Ok(call) => vec![(call, timing)],
+            Err(error) => return Err(native_core_error(error, stream)),
+        }
+    };
+    let incremental = state.server_args.incremental_streaming_output;
+    if stream {
+        use futures::StreamExt;
+        return Ok(NativeOutput::Stream(
+            generation_event_stream(calls, incremental, is_batch).boxed(),
+        ));
+    }
+    let drained = futures::future::join_all(calls.into_iter().map(
+        |(mut call, request_timing)| async move {
+            let client_rid = call.public_id().to_owned();
+            drain_unary(&mut call, &client_rid, request_timing).await
+        },
+    ))
+    .await;
+    let (status, body) = if is_batch {
+        let items: Vec<GenerateItem> = drained.into_iter().map(|(_, item)| item).collect();
+        (StatusCode::OK, serde_json::to_vec(&items))
+    } else {
+        let (status, item) = drained.into_iter().next().expect("one drained item");
+        (status, serde_json::to_vec(&item))
+    };
+    Ok(NativeOutput::Unary {
+        status,
+        body: body.unwrap_or_default(),
+    })
+}
+
 /// A single (non-batched) `/generate`: submit one request, then either stream its
 /// SSE frames or fold to one unary response.
 async fn generate_single(
@@ -275,7 +353,8 @@ async fn drain_unary(
                 timing.observe_first_output();
                 timing.finish();
                 accumulated.append_delta(&out);
-                let frame = accumulated.frame(rid_str, None, Some(e2e_latency(&timing)));
+                let mut frame = accumulated.frame(rid_str, None, Some(e2e_latency(&timing)));
+                stamp_sent(&mut frame);
                 return (StatusCode::OK, GenerateItem::Frame(Box::new(frame)));
             }
             CoreEvent::Failed(error) => {
@@ -364,6 +443,15 @@ fn generation_event_stream(
             .map(|(_, timing)| timing.clone())
             .collect();
         let mut accumulated: Vec<CoreOutput> = (0..n).map(|_| CoreOutput::default()).collect();
+        // Python stamps `response_sent_to_client_ts` on a request's first frame only.
+        let mut sent = vec![false; n];
+        let mut first = |frame: api::GenerateResponse, i: usize| {
+            let mut frame = frame;
+            if !std::mem::replace(&mut sent[i], true) {
+                stamp_sent(&mut frame);
+            }
+            frame
+        };
 
         // Batch position, tagged onto every frame (a single request omits it).
         let idx = |i: usize| with_index.then_some(i as u32);
@@ -396,7 +484,7 @@ fn generation_event_stream(
                         timings[i].observe_first_output();
                         accumulated[i].append_delta(&out);
                         if incremental {
-                            yield json_string(&delta_frame(out, &accumulated[i], &rid_strs[i], idx(i), None));
+                            yield json_string(&first(delta_frame(out, &accumulated[i], &rid_strs[i], idx(i), None), i));
                         } else {
                             coalesced = true;
                         }
@@ -427,17 +515,27 @@ fn generation_event_stream(
                 } else {
                     std::mem::take(&mut accumulated[i]).frame(&rid_strs[i], idx(i), e2e_latency)
                 };
-                yield json_string(&frame);
+                yield json_string(&first(frame, i));
             } else {
                 if coalesced {
                     // An intermediate cumulative frame has to clone: the accumulated
                     // output stays behind for the next one.
-                    yield json_string(&accumulated[i].clone().frame(&rid_strs[i], idx(i), None));
+                    yield json_string(&first(accumulated[i].clone().frame(&rid_strs[i], idx(i), None), i));
                 }
                 futs.push(recv_indexed(i, call)); // keep this item flowing
             }
         }
         yield "[DONE]".to_string();
+    }
+}
+
+/// `response_sent_to_client_ts`: wall-clock seconds as the frame is handed to the client.
+fn stamp_sent(frame: &mut api::GenerateResponse) {
+    if let Some(meta) = frame.meta_info.as_mut() {
+        meta.response_sent_to_client_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs_f64());
     }
 }
 

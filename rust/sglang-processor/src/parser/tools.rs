@@ -19,7 +19,7 @@ use futures::{Stream, StreamExt};
 
 use super::ChatToolCallDelta;
 use crate::ProcessorError;
-use crate::tool_call::{ToolDetector, tool_call_id, tool_detector};
+use crate::tool_call::{ToolDetector, ToolSpec, tool_call_id, tool_detector_for};
 
 /// Collect top-level and dynamic system-message tools without moving their
 /// declarations in the prompt. Dynamic tools accept wrapped OpenAI declarations
@@ -189,11 +189,14 @@ pub(super) fn post_tool_terminal_markers(parser: Option<&str>) -> &'static [&'st
 type ChunkStream =
     Pin<Box<dyn Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>>;
 
-fn tool_names(tools: Option<&[ToolDefinition]>) -> Vec<String> {
+fn tool_specs(tools: Option<&[ToolDefinition]>) -> Vec<ToolSpec> {
     tools
         .into_iter()
         .flatten()
-        .map(|tool| tool.name.clone())
+        .map(|tool| ToolSpec {
+            name: tool.name.clone(),
+            parameters: tool.parameters.clone(),
+        })
         .collect()
 }
 
@@ -209,8 +212,8 @@ pub fn tool_call_stream<S>(
 where
     S: Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send + 'static,
 {
-    let names = tool_names(tools.as_deref());
-    let Some(_) = tool_detector(parser, names.clone()) else {
+    let specs = tool_specs(tools.as_deref());
+    let Some(_) = tool_detector_for(parser, specs.clone()) else {
         let parser = dynamo_tool_parser_name(parser).to_owned();
         return Box::pin(apply_tool_calling_jail(
             Some(parser),
@@ -229,7 +232,7 @@ where
             for choice in item.data.iter_mut().flat_map(|chunk| chunk.choices.iter_mut()) {
                 let detector = detectors
                     .entry(choice.index)
-                    .or_insert_with(|| tool_detector(&parser, names.clone()).expect("checked"));
+                    .or_insert_with(|| tool_detector_for(&parser, specs.clone()).expect("checked"));
                 let text = match choice.delta.content.take() {
                     Some(ChatCompletionMessageContent::Text(text)) => text,
                     _ => String::new(),
@@ -239,14 +242,19 @@ where
                     (!normal.is_empty()).then_some(ChatCompletionMessageContent::Text(normal));
                 if !calls.is_empty() {
                     called.insert(choice.index);
-                    let calls = calls.into_iter().map(|call| ChatCompletionMessageToolCallChunk {
-                        index: call.tool_index as u32,
-                        id: Some(tool_call_id()),
-                        r#type: Some(FunctionType::Function),
-                        function: Some(FunctionCallStream {
-                            name: Some(call.name),
-                            arguments: Some(call.parameters),
-                        }),
+                    // Python sends the id and name once, with a call's first item;
+                    // later items carry only argument fragments.
+                    let calls = calls.into_iter().map(|call| {
+                        let named = !call.name.is_empty();
+                        ChatCompletionMessageToolCallChunk {
+                            index: call.tool_index as u32,
+                            id: named.then(tool_call_id),
+                            r#type: Some(FunctionType::Function),
+                            function: Some(FunctionCallStream {
+                                name: named.then_some(call.name),
+                                arguments: Some(call.parameters),
+                            }),
+                        }
                     });
                     choice.delta.tool_calls = Some(calls.collect());
                 }
@@ -266,7 +274,7 @@ pub async fn parse_tool_calls(
     text: &str,
     tools: Option<&[ToolDefinition]>,
 ) -> Result<(Vec<ToolCallResponse>, Option<String>), String> {
-    let Some(detector) = tool_detector(parser, tool_names(tools)) else {
+    let Some(detector) = tool_detector_for(parser, tool_specs(tools)) else {
         let parser = dynamo_tool_parser_name(parser);
         return try_tool_call_parse_aggregate_finalize(text, Some(parser), tools)
             .await

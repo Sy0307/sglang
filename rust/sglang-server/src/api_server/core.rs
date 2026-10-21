@@ -10,6 +10,7 @@
 
 mod error;
 mod frame;
+pub(crate) use frame::WEIGHT_VERSION;
 mod handle;
 mod prefetch;
 

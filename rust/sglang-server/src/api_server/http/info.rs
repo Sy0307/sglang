@@ -7,7 +7,7 @@
 
 use axum::{
     Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
@@ -25,6 +25,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         // Control-plane: the core performs the typed operation and this
         // adapter renders its result as one non-streamed JSON response.
         .route("/server_info", get(server_info))
+        // Deprecated Python alias, kept for clients (e.g. the bench scripts) that still call it.
+        .route("/get_server_info", get(server_info))
+        // Admin: flush the radix cache (Python `/flush_cache`, GET or POST, `?timeout=`).
+        .route("/flush_cache", get(flush_cache).post(flush_cache))
         // Static config, no scheduler round-trip. `/get_model_info` (+ `/model_info`
         // alias).
         .route("/get_model_info", get(model_info))
@@ -69,6 +73,45 @@ async fn model_info(State(state): State<Arc<AppState>>) -> Response {
         serde_json::to_vec(&info).unwrap_or_default(),
     )
         .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct FlushCacheQuery {
+    #[serde(default)]
+    timeout: f64,
+}
+
+/// `GET|POST /flush_cache` — Python's text responses and status codes: 200 when
+/// the scheduler flushed, 400 with its message when it declined.
+async fn flush_cache(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FlushCacheQuery>,
+) -> Response {
+    if query.timeout < 0.0 {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "timeout must be >= 0").into_response();
+    }
+    match state.core.flush_cache(Some(query.timeout)).await {
+        Ok((true, _)) => (
+            StatusCode::OK,
+            "Cache flushed.\nPlease check backend logs for more details. \
+             (When there are running or waiting requests, the operation will not be performed.)\n",
+        )
+            .into_response(),
+        Ok((false, message)) => {
+            let message = if message.is_empty() {
+                "Flush cache failed.\n".to_owned()
+            } else {
+                message
+            };
+            (StatusCode::BAD_REQUEST, message).into_response()
+        }
+        Err(CoreError::Unavailable) => native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable",
+            false,
+        ),
+        Err(error) => (error.http_status(), error.to_string()).into_response(),
+    }
 }
 
 /// `GET /server_info` — serialize typed, allowlisted runtime metrics plus

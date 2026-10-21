@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{State, rejection::JsonRejection},
+    body::Bytes,
+    extract::State,
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -58,18 +59,23 @@ struct ChatRequest {
     routing: PDRoutingFields,
 }
 
-async fn chat_completions(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<ChatRequest>, JsonRejection>,
-) -> Response {
+async fn chat_completions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    // Python's chat layer, ported (`parity`); what it does not reproduce stays here.
+    if let Some(response) = super::parity::chat(&state, &body).await {
+        return response;
+    }
     let ChatRequest {
         request,
         chat_template_kwargs,
         routing,
-    } = match body {
-        Ok(Json(request)) => request,
-        Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
+    } = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to deserialize the JSON body into the target type: {error}"),
+                false,
+            );
         }
     };
     if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {
@@ -191,11 +197,18 @@ async fn chat_completions(
         || state.server_args.stream_response_default_include_usage;
     let mut submitted = Vec::with_capacity(choices_per_prompt);
 
-    // V4 prefills <think>, so the generated stream has no opening marker.
-    let starts_in_reasoning = matches!(
+    // V4 prefills <think>, so the generated stream has no opening marker; Qwen3's
+    // template opens it unless `enable_thinking` is false (Python's
+    // `_get_reasoning_from_request` forces reasoning then).
+    let starts_in_reasoning = (matches!(
         reasoning_parser.as_deref(),
         Some("deepseek-v4" | "deepseek_v4" | "deepseekv4")
-    ) && prompt.ends_with("<think>");
+    ) && prompt.ends_with("<think>"))
+        || (reasoning_parser.as_deref() == Some("qwen3")
+            && chat_template_kwargs
+                .as_ref()
+                .and_then(|kwargs| kwargs.get("enable_thinking"))
+                != Some(&serde_json::Value::Bool(false)));
     let mut prompt = Some(prompt);
     for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));

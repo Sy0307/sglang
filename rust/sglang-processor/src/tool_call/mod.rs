@@ -3,8 +3,17 @@
 //! Dynamo, like `think`, so `openai` needs no `parser` feature.
 
 mod models;
+mod pyval;
+pub(crate) mod structural_tag;
 
-pub(crate) use self::models::tool_detector;
+pub(crate) use self::models::tool_detector_for;
+
+/// A tool the request offers: its name and `function.parameters` schema.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ToolSpec {
+    pub name: String,
+    pub parameters: Option<serde_json::Value>,
+}
 
 /// One parsed call: `ToolCallItem`.
 #[derive(Debug, Clone, PartialEq)]

@@ -2001,68 +2001,59 @@ impl<'de> ::serde::Deserialize<'de> for HiddenStateRow {
 
 impl ::serde::Serialize for GenerateMetaInfo {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use ::serde::ser::SerializeMap;
+        // Python TokenizerManager's meta_info: its keys, order and null placeholders.
         let mut map = serializer.serialize_map(None)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "id", &self.id)?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "prompt_tokens",
-            &self.prompt_tokens,
-        )?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "completion_tokens",
-            &self.completion_tokens,
-        )?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "finish_reason",
-            &self.finish_reason,
-        )?;
-        if let Some(v) = &self.output_token_logprobs {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "output_token_logprobs", v)?;
+        map.serialize_entry("id", &self.id)?;
+        map.serialize_entry("finish_reason", &self.finish_reason)?;
+        map.serialize_entry("prompt_tokens", &self.prompt_tokens)?;
+        if let Some(v) = &self.weight_version {
+            map.serialize_entry("weight_version", v)?;
         }
+        map.serialize_entry("num_retractions", &self.num_retractions)?;
         if let Some(v) = &self.input_token_logprobs {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "input_token_logprobs", v)?;
+            map.serialize_entry("input_token_logprobs", v)?;
         }
-        if !self.output_top_logprobs.is_empty() {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "output_top_logprobs",
-                &self.output_top_logprobs,
-            )?;
+        if let Some(v) = &self.output_token_logprobs {
+            map.serialize_entry("output_token_logprobs", v)?;
+            map.serialize_entry("output_token_logprobs_length", &v.entries.len())?;
         }
         if !self.input_top_logprobs.is_empty() {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "input_top_logprobs",
-                &self.input_top_logprobs,
-            )?;
+            map.serialize_entry("input_top_logprobs", &self.input_top_logprobs)?;
         }
-        if !self.output_token_ids_logprobs.is_empty() {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "output_token_ids_logprobs",
-                &self.output_token_ids_logprobs,
-            )?;
+        if !self.output_top_logprobs.is_empty() {
+            map.serialize_entry("output_top_logprobs", &self.output_top_logprobs)?;
         }
         if !self.input_token_ids_logprobs.is_empty() {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "input_token_ids_logprobs",
-                &self.input_token_ids_logprobs,
+            map.serialize_entry("input_token_ids_logprobs", &self.input_token_ids_logprobs)?;
+        }
+        if !self.output_token_ids_logprobs.is_empty() {
+            map.serialize_entry("output_token_ids_logprobs", &self.output_token_ids_logprobs)?;
+        }
+        map.serialize_entry("reasoning_tokens", &self.reasoning_tokens)?;
+        map.serialize_entry("completion_tokens", &self.completion_tokens)?;
+        map.serialize_entry("cached_tokens", &self.cached_tokens)?;
+        // The scheduler sends the spans with a request's finished frame only.
+        if let Some(v) = &self.weight_version
+            && self.finish_reason.is_some()
+        {
+            map.serialize_entry(
+                "weight_versions",
+                &[::serde_json::json!({"version": v, "start": 0, "end": self.completion_tokens})],
             )?;
         }
+        map.serialize_entry("cached_tokens_details", &())?;
+        map.serialize_entry("dp_rank", &())?;
         if !self.hidden_states.is_empty() {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "hidden_states",
-                &self.hidden_states,
-            )?;
+            map.serialize_entry("hidden_states", &self.hidden_states)?;
         }
         if let Some(v) = &self.e2e_latency {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "e2e_latency", v)?;
+            map.serialize_entry("e2e_latency", v)?;
         }
-        ::serde::ser::SerializeMap::end(map)
+        if let Some(v) = &self.response_sent_to_client_ts {
+            map.serialize_entry("response_sent_to_client_ts", v)?;
+        }
+        map.end()
     }
 }
 
@@ -2090,8 +2081,18 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                 let mut f_input_token_ids_logprobs = None;
                 let mut f_hidden_states = None;
                 let mut f_e2e_latency = None;
+                let mut f_cached_tokens = None;
+                let mut f_reasoning_tokens = None;
+                let mut f_num_retractions = None;
+                let mut f_weight_version = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
+                        "cached_tokens" => f_cached_tokens = Some(map.next_value::<u32>()?),
+                        "reasoning_tokens" => f_reasoning_tokens = Some(map.next_value::<u32>()?),
+                        "num_retractions" => f_num_retractions = Some(map.next_value::<u32>()?),
+                        "weight_version" => {
+                            f_weight_version = map.next_value::<Option<::prost::alloc::string::String>>()?
+                        }
                         "id" => {
                             if f_id.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("id"));
@@ -2213,6 +2214,11 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                     input_token_ids_logprobs: f_input_token_ids_logprobs.unwrap_or_default(),
                     hidden_states: f_hidden_states.unwrap_or_default(),
                     e2e_latency: f_e2e_latency.flatten(),
+                    cached_tokens: f_cached_tokens.unwrap_or_default(),
+                    reasoning_tokens: f_reasoning_tokens.unwrap_or_default(),
+                    num_retractions: f_num_retractions.unwrap_or_default(),
+                    weight_version: f_weight_version,
+                    response_sent_to_client_ts: None,
                 })
             }
         }
